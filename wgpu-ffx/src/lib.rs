@@ -429,7 +429,6 @@ impl FsrContext {
         let workgroups_spd_x = info.render_size[0].div_ceil(spd_thread_group_work_region_dim);
         let workgroups_spd_y = info.render_size[1].div_ceil(spd_thread_group_work_region_dim);
 
-        let error_scope_guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         // Clear reconstructed depth for max depth store.
         if reset_accumulation {
             let zeroed_resources = [
@@ -542,10 +541,6 @@ impl FsrContext {
             &view.resources.spd_mips,
             &wgpu::ImageSubresourceRange::default(),
         );
-
-        if let Some(err) = pollster::block_on(error_scope_guard.pop()) {
-            panic!("Error during Clearing: {err}");
-        }
 
         let mut compute_pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor {
