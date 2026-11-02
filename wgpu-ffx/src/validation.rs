@@ -210,11 +210,8 @@ pub fn check_dispatch(
                 camera_near: info.camera_near,
             });
         }
-        if info.camera_far < 0.075 {
-            return Err(FsrDispatchError::InvertedDepthFarTooLow {
-                camera_far: info.camera_far,
-            });
-        }
+        // A near plane closer than 0.075 is only a warning in the FidelityFX SDK (possible depth
+        // separation artifacts), not a reason to refuse the frame, so it is not checked here.
     } else {
         if info.camera_near > info.camera_far {
             return Err(FsrDispatchError::NormalDepthNearGreaterThanFar {
@@ -227,11 +224,7 @@ pub fn check_dispatch(
                 camera_far: info.camera_far,
             });
         }
-        if info.camera_near < 0.075 {
-            return Err(FsrDispatchError::CameraNearTooLow {
-                camera_near: info.camera_near,
-            });
-        }
+        // A near plane closer than 0.075 is only a warning in the FidelityFX SDK, see above.
     }
 
     // Check camera FOV
