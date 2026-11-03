@@ -201,9 +201,10 @@ impl FsrContext {
             } else {
                 Fsr3upscalerOptionLowResolutionMotionVectors::On
             },
-            // LUT vs reference lanczos. LUT is used on GPUs with 32-64 wave lane range;
-            // since we don't query this from wgpu yet, default to reference (Off).
-            Fsr3upscalerOptionReprojectUseLanczosType::Off,
+            // MPS: the lanczos LUT, not the reference math. AMD's SDK picks the LUT for a 32-64 wave lane range
+            // (RDNA); measured on Intel Xe-LP it takes about 4.7 ms off a 50 ms frame at 1080p, a fifth of
+            // FSR's time, with the picture within run noise (MPS reviews/2026-11-03-hangar-performance-round-3.md).
+            Fsr3upscalerOptionReprojectUseLanczosType::On,
             Half::Off,
             Wave64::Off,
         );
