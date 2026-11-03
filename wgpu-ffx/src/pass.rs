@@ -84,6 +84,8 @@ impl FsrPass {
         }
     }
 
+    /// Records the pass. `bind_group` holds this pass's bind group for the dispatch's resources: created on the
+    /// first dispatch with them, then reused (see `BindGroupCache`).
     #[expect(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
@@ -93,32 +95,34 @@ impl FsrPass {
         info: &FsrDispatchInfo,
         flags: FsrContextFlags,
         frame_kind: FrameKind,
+        bind_group: &mut Option<wgpu::BindGroup>,
         x: u32,
         y: u32,
     ) {
-        let resources_list = self.kind.resources(flags);
-        let resources: Vec<_> = resources_list
-            .into_iter()
-            .map(|access| resources.to_view(info, access, frame_kind))
-            .collect();
-
-        let bind_group_entries: Vec<_> = resources
-            .iter()
-            .enumerate()
-            .map(|(i, owned_resource)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: owned_resource.into(),
+        let bind_group = bind_group.get_or_insert_with(|| {
+            let resources: Vec<_> = self
+                .kind
+                .resources(flags)
+                .into_iter()
+                .map(|access| resources.to_view(info, access, frame_kind))
+                .collect();
+            let bind_group_entries: Vec<_> = resources
+                .iter()
+                .enumerate()
+                .map(|(i, owned_resource)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: owned_resource.into(),
+                })
+                .collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("{} Bind Group", self.kind.label())),
+                layout: &self.bgl,
+                entries: &bind_group_entries,
             })
-            .collect();
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(&format!("{} Bind Group", self.kind.label())),
-            layout: &self.bgl,
-            entries: &bind_group_entries,
         });
 
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_bind_group(0, &*bind_group, &[]);
         pass.dispatch_workgroups(x, y, 1);
     }
 }
@@ -151,6 +155,9 @@ pub(crate) enum FsrPassKind {
 }
 
 impl FsrPassKind {
+    /// The number of kinds, for tables indexed by `kind as usize`.
+    pub const COUNT: usize = 11;
+
     pub fn label(&self) -> &'static str {
         match self {
             FsrPassKind::PrepareInputs => "FSR3 Prepare Inputs",

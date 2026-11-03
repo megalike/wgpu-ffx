@@ -97,6 +97,77 @@ pub struct FsrView {
     pre_exposure: f32,
     previous_frame_pre_exposure: f32,
     frame_kind: FrameKind,
+    bind_groups: BindGroupCache,
+}
+
+/// The external resources a dispatch binds, with the frame's parity (which picks the view's history halves); the
+/// view's own resources live as long as the view, so these decide whether a pass's bind group can be reused.
+#[derive(PartialEq, Eq)]
+struct BindingKey {
+    frame_kind: FrameKind,
+    color: wgpu::Texture,
+    depth: wgpu::Texture,
+    motion_vectors: wgpu::Texture,
+    exposure: Option<wgpu::Texture>,
+    reactive_mask: Option<wgpu::Texture>,
+    transparency_and_composition: Option<wgpu::Texture>,
+    dilated_depth: wgpu::Texture,
+    dilated_motion_vectors: wgpu::Texture,
+    reconstructed_previous_depth: wgpu::Buffer,
+    output: wgpu::Texture,
+}
+
+impl BindingKey {
+    fn new(info: &FsrDispatchInfo, frame_kind: FrameKind) -> Self {
+        Self {
+            frame_kind,
+            color: info.color.clone(),
+            depth: info.depth.clone(),
+            motion_vectors: info.motion_vectors.clone(),
+            exposure: info.exposure.clone(),
+            reactive_mask: info.reactive_mask.clone(),
+            transparency_and_composition: info.transparency_and_composition.clone(),
+            dilated_depth: info.dilated_depth.clone(),
+            dilated_motion_vectors: info.dilated_motion_vectors.clone(),
+            reconstructed_previous_depth: info.reconstructed_previous_depth.clone(),
+            output: info.output.clone(),
+        }
+    }
+}
+
+/// Bind groups (and the texture views in them) of every pass, per set of external resources. A caller usually
+/// alternates a few sets (the two frame parities, ping-ponged targets), so the passes stop creating about a hundred
+/// views and seven bind groups per dispatch. The most recent sets are kept; an older one is dropped with the
+/// textures it holds.
+#[derive(Default)]
+struct BindGroupCache {
+    entries: Vec<(
+        BindingKey,
+        [Option<wgpu::BindGroup>; pass::FsrPassKind::COUNT],
+    )>,
+}
+
+impl BindGroupCache {
+    const MAX_ENTRIES: usize = 4;
+
+    fn get(
+        &mut self,
+        info: &FsrDispatchInfo,
+        frame_kind: FrameKind,
+    ) -> &mut [Option<wgpu::BindGroup>; pass::FsrPassKind::COUNT] {
+        let key = BindingKey::new(info, frame_kind);
+        match self.entries.iter().position(|(k, _)| *k == key) {
+            Some(i) => {
+                let entry = self.entries.remove(i);
+                self.entries.insert(0, entry);
+            }
+            None => {
+                self.entries.truncate(Self::MAX_ENTRIES - 1);
+                self.entries.insert(0, (key, Default::default()));
+            }
+        }
+        &mut self.entries[0].1
+    }
 }
 
 impl FsrContext {
@@ -493,25 +564,20 @@ impl FsrContext {
             );
         }
 
-        let clear_value = if self.flags.contains(FsrContextFlags::DEPTH_INVERTED) {
-            [0.0_f32; 4]
+        // Zero fills are transfer clears: no uniform buffer, bind group or compute dispatch per frame. Only the
+        // non-inverted depth's 1.0 needs the clearing shader.
+        if self.flags.contains(FsrContextFlags::DEPTH_INVERTED) {
+            encoder.clear_buffer(&info.reconstructed_previous_depth, 0, None);
         } else {
-            [1.0_f32; 4]
-        };
+            self.buffer_clearer.dispatch(
+                &self.device,
+                &info.reconstructed_previous_depth,
+                encoder,
+                bytemuck::cast([1.0_f32; 4]),
+            );
+        }
 
-        self.buffer_clearer.dispatch(
-            &self.device,
-            &info.reconstructed_previous_depth,
-            encoder,
-            bytemuck::cast(clear_value),
-        );
-
-        self.buffer_clearer.dispatch(
-            &self.device,
-            &view.resources.spd_atomic_counter,
-            encoder,
-            [0, 0, 0, 0],
-        );
+        encoder.clear_buffer(&view.resources.spd_atomic_counter, 0, None);
 
         view.constants.spd = constants::SpdConstants::new(spd::RectInput::new(
             info.render_size[0],
@@ -542,6 +608,8 @@ impl FsrContext {
             &wgpu::ImageSubresourceRange::default(),
         );
 
+        let bind_groups = view.bind_groups.get(info, view.frame_kind);
+
         let mut compute_pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("FsrContext::dispatch::compute_pass"),
@@ -556,6 +624,7 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[pass::FsrPassKind::PrepareInputs as usize],
             workgroups_src_x,
             workgroups_src_y,
         );
@@ -566,6 +635,7 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[pass::FsrPassKind::LumaPyramid as usize],
             workgroups_spd_x,
             workgroups_spd_y,
         );
@@ -576,6 +646,7 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[pass::FsrPassKind::ShadingChangePyramid as usize],
             workgroups_spd_x,
             workgroups_spd_y,
         );
@@ -586,6 +657,7 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[pass::FsrPassKind::ShadingChange as usize],
             workgroups_shading_change_x,
             workgroups_shading_change_y,
         );
@@ -596,6 +668,7 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[pass::FsrPassKind::PrepareReactivity as usize],
             workgroups_src_x,
             workgroups_src_y,
         );
@@ -606,13 +679,17 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[pass::FsrPassKind::LumaInstability as usize],
             workgroups_src_x,
             workgroups_src_y,
         );
-        let accumulate_pass = if info.enable_sharpening {
-            &self.pass_accumulate_sharpen
+        let (accumulate_pass, accumulate_kind) = if info.enable_sharpening {
+            (
+                &self.pass_accumulate_sharpen,
+                pass::FsrPassKind::AccumulateSharpen,
+            )
         } else {
-            &self.pass_accumulate
+            (&self.pass_accumulate, pass::FsrPassKind::Accumulate)
         };
         accumulate_pass.dispatch(
             &self.device,
@@ -621,6 +698,7 @@ impl FsrContext {
             info,
             self.flags,
             view.frame_kind,
+            &mut bind_groups[accumulate_kind as usize],
             workgroups_dst_x,
             workgroups_dst_y,
         );
@@ -637,6 +715,7 @@ impl FsrContext {
                 info,
                 self.flags,
                 view.frame_kind,
+                &mut bind_groups[pass::FsrPassKind::Rcas as usize],
                 workgroups_rcas_x,
                 workgroups_rcas_y,
             );
@@ -649,6 +728,7 @@ impl FsrContext {
                 info,
                 self.flags,
                 view.frame_kind,
+                &mut bind_groups[pass::FsrPassKind::DebugView as usize],
                 workgroups_dst_x,
                 workgroups_dst_y,
             );
@@ -713,6 +793,7 @@ impl FsrView {
             pre_exposure: 1.0,
             previous_frame_pre_exposure: 1.0,
             frame_kind: FrameKind::Even,
+            bind_groups: BindGroupCache::default(),
         }
     }
 
